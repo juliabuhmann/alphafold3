@@ -84,6 +84,7 @@ _DEFAULT_DB_DIR = _HOME_DIR / 'public_databases'
 
 @enum.unique
 class JaxBackend(enum.StrEnum):
+  AUTO = enum.auto()
   CPU = enum.auto()
   GPU = enum.auto()
 
@@ -253,6 +254,20 @@ _SEQRES_DATABASE_PATH = flags.DEFINE_string(
 )
 
 
+def _resolve_jax_backend() -> JaxBackend:
+  """Returns the backend to run on, auto-detecting a GPU if --jax_backend=auto."""
+  if _JAX_BACKEND.value != JaxBackend.AUTO:
+    return _JAX_BACKEND.value
+  try:
+    has_gpu = bool(jax.local_devices(backend='gpu'))
+  except RuntimeError:
+    has_gpu = False  # JAX has no GPU backend registered at all.
+  if has_gpu:
+    return JaxBackend.GPU
+  print('No JAX GPU backend found, falling back to CPU-only inference.')
+  return JaxBackend.CPU
+
+
 def _num_cpus_for_msa_tools() -> int:
   try:
     # Unfortunately, os.process_cpu_count() is only available in Python 3.13+.
@@ -349,14 +364,16 @@ _GPU_DEVICE = flags.DEFINE_integer(
 )
 _JAX_BACKEND = flags.DEFINE_enum_class(
     'jax_backend',
-    default=JaxBackend.GPU,
+    default=JaxBackend.AUTO,
     enum_class=JaxBackend,
     help=(
         'JAX backend to use. "gpu" uses a GPU for inference. "cpu" uses a CPU'
         ' only for inference. This is much slower than using a GPU, but can be'
         ' useful for testing or running on systems without a GPU supported by'
         ' JAX. If you set this flag to "cpu", you must also set'
-        ' --flash_attention_implementation=xla.'
+        ' --flash_attention_implementation=xla. "auto" (the default) uses a GPU'
+        ' if JAX exposes one and otherwise falls back to the CPU, setting'
+        ' --flash_attention_implementation=xla for you.'
     ),
 )
 _BUCKETS = flags.DEFINE_list(
@@ -1103,15 +1120,25 @@ def main(_):
     print(f'Failed to create output directory {_OUTPUT_DIR.value}: {e}')
     raise
 
+  jax_backend = _resolve_jax_backend() if _RUN_INFERENCE.value else None
   if _RUN_INFERENCE.value:
     # Fail early on incompatible devices, but only if we're running inference.
-    if _JAX_BACKEND.value == JaxBackend.CPU:
+    if jax_backend == JaxBackend.CPU:
       if _FLASH_ATTENTION_IMPLEMENTATION.value != 'xla':
-        raise ValueError(
-            'For CPU-only inference, the --flash_attention_implementation must'
-            ' be set to "xla".'
-        )
-    elif _JAX_BACKEND.value == JaxBackend.GPU:
+        if _JAX_BACKEND.value == JaxBackend.AUTO:
+          # The CPU was auto-detected rather than asked for, so pick the only
+          # flash attention implementation that can run on it.
+          print(
+              'Setting --flash_attention_implementation=xla, required for'
+              ' CPU-only inference.'
+          )
+          _FLASH_ATTENTION_IMPLEMENTATION.value = 'xla'
+        else:
+          raise ValueError(
+              'For CPU-only inference, the --flash_attention_implementation'
+              ' must be set to "xla".'
+          )
+    elif jax_backend == JaxBackend.GPU:
       gpu_devices = jax.local_devices(backend='gpu')
       if gpu_devices:
         compute_capability = float(
@@ -1140,7 +1167,7 @@ def main(_):
                 ' --flash_attention_implementation must be set to "xla".'
             )
     else:
-      raise ValueError(f'Unsupported JAX backend: {_JAX_BACKEND.value}')
+      raise ValueError(f'Unsupported JAX backend: {jax_backend}')
 
   max_template_date = datetime.date.fromisoformat(_MAX_TEMPLATE_DATE.value)
   if _RUN_DATA_PIPELINE.value:
@@ -1200,18 +1227,18 @@ def main(_):
     print('\n' + '\n'.join(notice) + '\n')
 
   if _RUN_INFERENCE.value:
-    devices = jax.local_devices(backend=_JAX_BACKEND.value)
-    if _JAX_BACKEND.value == JaxBackend.CPU:
+    devices = jax.local_devices(backend=jax_backend)
+    if jax_backend == JaxBackend.CPU:
       device = devices[0]
       print(f'Found local CPU devices: {devices}, using device 0: {device}')
-    elif _JAX_BACKEND.value == JaxBackend.GPU:
+    elif jax_backend == JaxBackend.GPU:
       print(
           f'Found local GPU devices: {devices}, using device '
           f'{_GPU_DEVICE.value}: {devices[_GPU_DEVICE.value]}'
       )
       device = devices[_GPU_DEVICE.value]
     else:
-      raise ValueError(f'Unsupported JAX backend: {_JAX_BACKEND.value}')
+      raise ValueError(f'Unsupported JAX backend: {jax_backend}')
 
     print('Building model from scratch...')
     model_runner = ModelRunner(
