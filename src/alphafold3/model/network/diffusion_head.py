@@ -359,17 +359,17 @@ def sample(
     key, key_noise, key_aug = jax.random.split(key, 3)
 
     positions = random_augmentation(
-        rng_key=key_aug, positions=positions, mask=mask
+        rng_key=key_aug, positions=positions, mask=mask  # pyrefly: ignore[bad-argument-type]
     )
 
     gamma = config.gamma_0 * (noise_level > config.gamma_min)
     t_hat = noise_level_prev * (1 + gamma)
 
-    # Guard against -0.0 (IEEE negative zero) when gamma=0: t_hat ==
-    # noise_level_prev, so t_hat**2 - noise_level_prev**2 == -0.0 and
-    # XLA's sqrt(-0.0) returns NaN.
     noise_scale = config.noise_scale * jnp.sqrt(
-        jnp.maximum(0.0, t_hat**2 - noise_level_prev**2)
+        # Don't take sqrt of a tiny negative number or of -0.0 (happens when
+        # running on CPU, or when gamma=0 so t_hat == noise_level_prev and
+        # XLA's sqrt(-0.0) returns NaN).
+        jnp.maximum(t_hat**2 - noise_level_prev**2, 0.0)
     )
     noise = noise_scale * jax.random.normal(key_noise, positions.shape)
     positions_noisy = positions + noise
