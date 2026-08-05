@@ -29,6 +29,15 @@ _AF3_TO_OF3_AATYPE = np.array(
 )
 
 
+# AF3's MSA one-hot has 32 classes: the same 31 aatype classes plus one spare
+# (trailing) class that AF3's featurizer never emits (see msa_features.py, where
+# '-'→21, RNA A/G/C/U→22-25, DNA A/G/C/T→26-29, unknown nucleic→30).  OF3 encodes
+# the MSA over its own 32-residue alphabet, so the rows must be permuted just
+# like aatype.  The unused AF3 class 31 is pointed at OF3's DN row (also never
+# activated under AF3 featurization).
+_AF3_TO_OF3_MSA = np.concatenate([_AF3_TO_OF3_AATYPE, [30]]).astype(np.int32)
+
+
 def _pad_element_weights(w: np.ndarray) -> np.ndarray:
     """Pad OF3 element embedding weights from 119 rows to 128 (AF3 uses 128 classes).
 
@@ -62,6 +71,17 @@ def _reorder_aatype_weights(w: np.ndarray) -> np.ndarray:
     Returns: (31, c_out) indexed by AF3 aatype class.
     """
     return w[_AF3_TO_OF3_AATYPE]
+
+
+def _reorder_msa_feat_weights(w: np.ndarray) -> np.ndarray:
+    """Reorder msa_feat input weights from OF3 to AF3 residue ordering.
+
+    Both layouts are [restype one-hot(32), has_deletion(1), deletion_value(1)],
+    so the shape is unchanged (34 rows) — only the 32 restype rows are permuted.
+
+    w shape: (34, c_out) indexed by OF3 MSA class → (34, c_out) in AF3 order.
+    """
+    return np.concatenate([w[_AF3_TO_OF3_MSA], w[32:34]], axis=0)
 
 
 def _reorder_features_1d(arr: np.ndarray, c_single: int = 384) -> np.ndarray:
@@ -385,8 +405,8 @@ def map_evoformer_input_embeddings(sd: dict, params: dict) -> None:
         params.setdefault(f'{scope}/bond_embedding', {})['weights'] = _t(
             _get(sd, 'input_embedder.linear_token_bonds.weight'))
     if _has(sd, 'msa_module_embedder.linear_m.weight'):
-        params.setdefault(f'{scope}/msa_activations', {})['weights'] = _t(
-            _get(sd, 'msa_module_embedder.linear_m.weight'))
+        params.setdefault(f'{scope}/msa_activations', {})['weights'] = _reorder_msa_feat_weights(
+            _t(_get(sd, 'msa_module_embedder.linear_m.weight')))
     if _has(sd, 'msa_module_embedder.linear_s_input.weight'):
         params.setdefault(f'{scope}/extra_msa_target_feat', {})['weights'] = _reorder_target_feat_weights(
             _t(_get(sd, 'msa_module_embedder.linear_s_input.weight')))
@@ -421,11 +441,20 @@ def map_confidence_head(sd: dict, params: dict,
         _populate_scope(params, stack_scope, _stack_blocks(_block_fn, n_layers))
     pe = 'aux_heads.pairformer_embedding'
     embed_scope = f'{scope_base}/~_embed_features'
+    # NOTE: AF3's left/right naming is TRANSPOSED between its two pair-embedding
+    # sites, so linear_i/linear_j cannot be mapped by name alone:
+    #   evoformer._seq_pair_embedding: left_single[:, None] + right_single[None]
+    #       -> left  indexes row i, right indexes column j
+    #   confidence_head._embed_features: left(tf) + right(tf)[:, None]
+    #       -> left  indexes column j, right indexes row i
+    # OF3 uses the evoformer convention in both places
+    # (z = emb_i[..., None, :] + emb_j[..., None, :, :], so linear_i is row i),
+    # hence linear_i -> right and linear_j -> left in the confidence head.
     if _has(sd, f'{pe}.linear_i.weight'):
-        _set(params, f'{embed_scope}/left_target_feat_project', 'weights',
+        _set(params, f'{embed_scope}/right_target_feat_project', 'weights',
              _reorder_target_feat_weights(_t(_get(sd, f'{pe}.linear_i.weight'))))
     if _has(sd, f'{pe}.linear_j.weight'):
-        _set(params, f'{embed_scope}/right_target_feat_project', 'weights',
+        _set(params, f'{embed_scope}/left_target_feat_project', 'weights',
              _reorder_target_feat_weights(_t(_get(sd, f'{pe}.linear_j.weight'))))
     if _has(sd, f'{pe}.linear_distance.weight'):
         _set(params, f'{embed_scope}/distogram_feat_project', 'weights', _t(_get(sd, f'{pe}.linear_distance.weight')))
@@ -614,7 +643,11 @@ def map_template_embedder(sd: dict, params: dict, *,
     for idx, attr in [(0, 'dgram_linear'), (8, 'linear_z')]:
         _set(params, f'{scope_ste}/template_pair_embedding_{idx}', 'weights',
              _t(_get(sd, f'{tpe}.{attr}.weight')))
-    for idx, attr in [(2, 'aatype_linear_1'), (3, 'aatype_linear_2')]:
+    # AF3's to_concat order puts aatype[None, :, :] (column j) at index 2 and
+    # aatype[:, None, :] (row i) at index 3, while OF3's aatype_linear_1 is the
+    # row-i projection (template_restype[..., None, :]) and aatype_linear_2 the
+    # column-j one. The indices are therefore crossed.
+    for idx, attr in [(3, 'aatype_linear_1'), (2, 'aatype_linear_2')]:
         _set(params, f'{scope_ste}/template_pair_embedding_{idx}', 'weights',
              _reorder_aatype_weights(_t(_get(sd, f'{tpe}.{attr}.weight'))))
     for idx, attr in [(1, 'pseudo_beta_mask_linear'), (4, 'x_linear'),

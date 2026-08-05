@@ -56,8 +56,51 @@ Handles the systematic PyTorch → JAX/Haiku translation:
 - **Attention head reshapes**: Q/K stored as `(H, D, in)` (transpose_weights=True); V as `(in, H, D)`
 - **SwiGLU concatenation**: OF3 has separate `linear_a` (gate) and `linear_b`; AF3 concatenates them as `[gate | linear]` for a single fused projection
 - **Layer stack aggregation**: OF3 has per-block parameter dicts (`blocks.0.*, blocks.1.*`); AF3's `hk.experimental.layer_stack` expects a leading stacked axis
+- **Residue alphabet permutation**: the two codebases order the residue classes differently, so every weight matrix whose input rows are indexed by residue type must be permuted (`_AF3_TO_OF3_AATYPE` / `_AF3_TO_OF3_MSA`):
 
-**Critical bug fixed during conversion**: TriangularMultiplication incoming `a`/`b` projection weights were swapped.
+  | | ordering |
+  |---|---|
+  | AF3 (31 classes, `POLYMER_TYPES_WITH_UNKNOWN_AND_GAP`) | `0-19` protein, `20` UNK, `21` GAP, `22-25` A/G/C/U, `26-29` DA/DG/DC/DT, `30` N |
+  | OF3 (32 classes, `STANDARD_RESIDUES_WITH_GAP_3`) | `0-19` protein, `20` UNK, `21-25` A/G/C/U/N, `26-30` DA/DG/DC/DT/DN, `31` GAP |
+
+  Protein and DNA indices coincide; **RNA is offset by one and GAP/N are in completely different slots**. The permuted matrices are `input_embedder.linear_s/linear_z_i/linear_z_j`, `msa_module_embedder.linear_s_input/linear_m`, `aux_heads.pairformer_embedding.linear_i/linear_j`, `template_pair_embedder.aatype_linear_1/2`, and `diffusion_conditioning.layer_norm_s/linear_s` (the `features_1d` block).
+
+**Critical bugs fixed during conversion**:
+- TriangularMultiplication incoming `a`/`b` projection weights were swapped.
+- `msa_module_embedder.linear_m` was transposed but **not** permuted through the residue alphabet. Its input is `[restype one-hot(32), has_deletion, deletion_value]` in both codebases, so the shapes matched (34 rows) and the error was silent. Consequences: MSA gaps (AF3 class 21) were embedded as OF3 RNA adenine, and RNA A/G/C/U were read one slot high (A→G, G→C, C→U, U→N). Protein residues and DNA bases were unaffected — but since gaps dominate any real MSA, this degraded protein predictions too.
+- **Row (i) / column (j) pair projections were swapped in the confidence head and the template embedder.** See below — this one is a trap laid by AF3's own naming.
+
+### The i/j trap: AF3's `left`/`right` naming is inconsistent
+
+AF3 builds a pair representation from a single representation in three places, and the meaning of `left`/`right` is **not the same in all of them**:
+
+```python
+# evoformer._seq_pair_embedding
+left_single[:, None] + right_single[None]        # out[i,j] = left[i] + right[j]   → left is row i
+
+# confidence_head._embed_features
+out  = Linear(name='left_target_feat_project')(target_feat)          # [N, c]
+out += Linear(name='right_target_feat_project')(target_feat)[:, None] # [N, 1, c]
+                                                 # out[i,j] = left[j] + right[i]   → left is column j
+
+# template_modules: to_concat order
+to_concat.append((aatype[None, :, :], 1))        # index 2 → column j
+to_concat.append((aatype[:, None, :], 1))        # index 3 → row i
+```
+
+OF3 consistently uses the evoformer convention — `linear_i` is always the row-i projection:
+
+```python
+z   = s_input_emb_i[..., None, :] + s_input_emb_j[..., None, :, :]   # input_embedder
+zij = zij + linear_i(si_input.unsqueeze(-2)) + linear_j(si_input.unsqueeze(-3))  # pairformer_embedding
+a   = ... + aatype_linear_1(template_restype_ti) + aatype_linear_2(template_restype_tj)
+```
+
+So mapping `linear_i → left` is **correct in the trunk and wrong in the confidence head**, and `aatype_linear_1 → template_pair_embedding_2` is wrong for the same reason. The converter had both by-name mappings; they are now crossed where required.
+
+**Symptom**: a swap here transposes the pair embedding that the confidence pairformer starts from. `PAE` is where it shows: it is the only asymmetric confidence output — PDE is explicitly symmetrized (`logits + logitsᵀ`), and pLDDT / experimentally-resolved come from the single representation. pTM and ipTM are derived from `pae_probs`, so they were affected as well.
+
+**Checked and confirmed consistent** (no fix needed): the PAE/PDE bin decoding — AF3's `linspace(0, 31.0, 63)` + half-step + catch-all and OF3's `get_bin_centers(0, 32, 64)` both yield centers `0.25, 0.75, …, 31.75`; and the representative-atom choice feeding `linear_distance` — AF3's pseudo-beta (CB, CA for Gly, C4 for purines, C2 for pyrimidines, atom 0 for ligands) matches OF3's `get_token_representative_atoms` exactly.
 
 ---
 
