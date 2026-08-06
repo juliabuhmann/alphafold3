@@ -37,6 +37,10 @@ _AF3_TO_OF3_AATYPE = np.array(
 # activated under AF3 featurization).
 _AF3_TO_OF3_MSA = np.concatenate([_AF3_TO_OF3_AATYPE, [30]]).astype(np.int32)
 
+# OF3's unknown-DNA class ('DN'), the one class AF3's 31-way alphabet has no slot
+# for (AF3 folds unknown DNA into the shared unknown-nucleic class 'N').
+_OF3_UNK_DNA_AATYPE = 30
+
 
 def _pad_element_weights(w: np.ndarray) -> np.ndarray:
     """Pad OF3 element embedding weights from 119 rows to 128 (AF3 uses 128 classes).
@@ -88,18 +92,31 @@ def _reorder_features_1d(arr: np.ndarray, c_single: int = 384) -> np.ndarray:
     """Reorder OF3 features_1d (single_emb + target_feat) along axis 0 to AF3 layout.
 
     OF3 layout: [single(c_single), atom_cross_att(384), OF3_aatype(32), OF3_profile(32), del_mean(1)]
-    AF3 layout: [single(c_single), AF3_aatype(31),      AF3_profile(31), del_mean(1),    atom_cross_att(384)]
+    AF3 layout: [single(c_single), AF3_aatype(31), UNK_DNA(1), AF3_profile(31), UNK_DNA(1),
+                 del_mean(1), atom_cross_att(384)]
+
+    Unlike every other residue-indexed matrix, the two aatype classes AF3 lacks
+    (OF3's unknown-DNA slot in restype and in profile) may NOT be dropped here:
+    this block feeds `single_cond_initial_norm`, a LayerNorm, which turns a zero
+    input into -mean/std. OF3 therefore always contributes those two columns
+    through their trained weights, and the normalisation statistics run over 833
+    channels rather than 831. Both effects are reproduced by keeping the columns
+    (diffusion_head inserts matching zero columns when of3_weights is set);
+    dropping them costs ~1.6e-3 relative error in the single conditioning.
 
     Works for 1-D (LayerNorm scale, shape c_single+449) and 2-D (Linear weights,
     shape (c_single+449, c_out)) arrays — reorders along axis 0.
     """
     remap = _AF3_TO_OF3_AATYPE
+    unk_dna = _OF3_UNK_DNA_AATYPE
     return np.concatenate([
         arr[0:c_single],
-        arr[c_single + 384 + remap],         # aatype rows
-        arr[c_single + 416 + remap],         # profile rows
-        arr[c_single + 448: c_single + 449], # del_mean
-        arr[c_single: c_single + 384],       # atom_cross_att
+        arr[c_single + 384 + remap],                        # aatype rows
+        arr[c_single + 384 + unk_dna: c_single + 385 + unk_dna],  # aatype UNK_DNA
+        arr[c_single + 416 + remap],                        # profile rows
+        arr[c_single + 416 + unk_dna: c_single + 417 + unk_dna],  # profile UNK_DNA
+        arr[c_single + 448: c_single + 449],                # del_mean
+        arr[c_single: c_single + 384],                       # atom_cross_att
     ], axis=0)
 
 
@@ -283,8 +300,7 @@ def convert_single_attention(sd: dict, prefix: str, H: int, D: int) -> dict[str,
 # ─── Block composers ──────────────────────────────────────────────────────────
 
 def _pairblock_params(sd: dict, prefix: str,
-                      pair_H: int, pair_D: int,
-                      tri_mul_hidden: int) -> dict[str, np.ndarray]:
+                      pair_H: int, pair_D: int) -> dict[str, np.ndarray]:
     d = {}
     for tag, of3_name, outgoing in [
         ('triangle_multiplication_outgoing', 'tri_mul_out', True),
@@ -303,11 +319,10 @@ def _pairblock_params(sd: dict, prefix: str,
 
 def pairformer_block_params(sd: dict, block_idx: int,
                              pair_H: int = 4, pair_D: int = 32,
-                             single_H: int = 16, single_D: int = 24,
-                             tri_mul_hidden: int = 128) -> dict[str, np.ndarray]:
+                             single_H: int = 16, single_D: int = 24) -> dict[str, np.ndarray]:
     prefix = f'pairformer_stack.blocks.{block_idx}'
     d = {}
-    for k, v in _pairblock_params(sd, f'{prefix}.pair_stack', pair_H, pair_D, tri_mul_hidden).items():
+    for k, v in _pairblock_params(sd, f'{prefix}.pair_stack', pair_H, pair_D).items():
         d[k] = v
     for k, v in convert_single_attention(sd, f'{prefix}.attn_pair_bias', single_H, single_D).items():
         d[k] = v
@@ -333,7 +348,7 @@ def msa_block_params(sd: dict, block_idx: int,
             d[f'outer_product_mean:{k[len("__top__/"):]}'] = v
         else:
             d[f'outer_product_mean/{k}'] = v
-    for k, v in _pairblock_params(sd, f'{prefix}.pair_stack', pair_H, pair_D, 128).items():
+    for k, v in _pairblock_params(sd, f'{prefix}.pair_stack', pair_H, pair_D).items():
         d[k] = v
     return d
 
@@ -431,7 +446,7 @@ def map_confidence_head(sd: dict, params: dict,
         def _block_fn(block_idx):
             prefix = f'aux_heads.pairformer_embedding.pairformer_stack.blocks.{block_idx}'
             d = {}
-            for k, v in _pairblock_params(sd, f'{prefix}.pair_stack', pair_H, pair_D, c_z).items():
+            for k, v in _pairblock_params(sd, f'{prefix}.pair_stack', pair_H, pair_D).items():
                 d[k] = v
             for k, v in convert_single_attention(sd, f'{prefix}.attn_pair_bias', single_H, single_D).items():
                 d[k] = v
@@ -659,7 +674,7 @@ def map_template_embedder(sd: dict, params: dict, *,
     _set(params, f'{scope_ste}/output_layer_norm', 'scale',  _get(sd, f'{tps}.layer_norm.weight'))
     _set(params, f'{scope_ste}/output_layer_norm', 'offset', _get(sd, f'{tps}.layer_norm.bias'))
     stacked = _stack_blocks(
-        lambda block_idx: _pairblock_params(sd, f'{tps}.blocks.{block_idx}', templ_H, templ_D, 0),
+        lambda block_idx: _pairblock_params(sd, f'{tps}.blocks.{block_idx}', templ_H, templ_D),
         n_templ_blocks)
     _populate_scope(params, f'{scope_ste}/__layer_stack_no_per_layer/template_embedding_iteration', stacked)
     _set(params, f'{scope_te}/output_linear', 'weights', _t(_get(sd, f'{te}.linear_t.weight')))
