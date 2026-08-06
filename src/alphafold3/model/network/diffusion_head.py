@@ -22,6 +22,7 @@
 from collections.abc import Callable
 
 from alphafold3.common import base_config
+from alphafold3.constants import residue_names
 from alphafold3.model import feat_batch
 from alphafold3.model import model_config
 from alphafold3.model.components import haiku_modules as hm
@@ -175,6 +176,30 @@ class DiffusionHead(hk.Module):
 
     target_feat = embeddings['target_feat']
     features_1d = jnp.concatenate([single_embedding, target_feat], axis=-1)
+    if self.global_config.of3_weights:
+      # OF3's restype and profile blocks carry 32 classes; AF3's carry 31 (AF3
+      # folds unknown DNA into the shared unknown-nucleic class). Everywhere
+      # else the extra class can simply be dropped from the weights, because a
+      # zero input column contributes nothing to a bare Linear. Here it cannot:
+      # the LayerNorm below maps a zero input to -mean/std, so OF3 always adds a
+      # trained contribution through those two columns and normalises over 833
+      # channels instead of 831. Re-insert them as zeros to match exactly; the
+      # weight converter emits its rows in this same order.
+      num_af3_restypes = residue_names.POLYMER_TYPES_NUM_WITH_UNKNOWN_AND_GAP
+      pad = jnp.zeros_like(features_1d[..., :1])
+      single_channels = single_embedding.shape[-1]
+      aatype_end = single_channels + num_af3_restypes
+      profile_end = aatype_end + num_af3_restypes
+      features_1d = jnp.concatenate(
+          [
+              features_1d[..., :aatype_end],
+              pad,  # OF3 aatype UNK_DNA
+              features_1d[..., aatype_end:profile_end],
+              pad,  # OF3 profile UNK_DNA
+              features_1d[..., profile_end:],
+          ],
+          axis=-1,
+      )
     single_cond = hm.LayerNorm(
         use_fast_variance=False,
         create_offset=False,

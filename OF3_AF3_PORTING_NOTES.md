@@ -42,6 +42,7 @@ or apply the same algorithm.
 | `network/diffusion_transformer.py` | Per-block pair LayerNorm + linear projection branch | OF3's `AttentionPairBias` contains its own `layer_norm_z` + `linear_z` per block; AF3 originally used a single shared LN before the entire block stack |
 | `network/diffusion_head.py` | Fourier `w`/`b` loaded as Haiku params instead of AF3's hardcoded constants | OF3 stores these as `register_buffer` (saved to `state_dict`); we convert them directly from the checkpoint so AF3's hardcoded JAX constants are never used |
 | `network/noise_level_embeddings.py` | Optional `weight`/`bias` args added to `noise_embeddings()` | Allows passing the converted Fourier values from `diffusion_head` instead of falling back to AF3's hardcoded values |
+| `network/diffusion_head.py` | Two zero columns re-inserted into `features_1d` | OF3's restype/profile blocks carry 32 classes to AF3's 31. Everywhere else the extra class is simply dropped from the weights — a zero input column contributes nothing to a bare `Linear`. Here it cannot be: `single_cond_initial_norm` is a LayerNorm, which maps a zero input to −mean/std, so OF3 always adds a trained contribution through those columns *and* normalises over 833 channels rather than 831. Dropping them cost ~1.6e-3 relative error in the diffusion single conditioning (verified: rel 2.2e-3 → 3.4e-7 against the OF3 module) |
 
 ---
 
@@ -101,6 +102,80 @@ So mapping `linear_i → left` is **correct in the trunk and wrong in the confid
 **Symptom**: a swap here transposes the pair embedding that the confidence pairformer starts from. `PAE` is where it shows: it is the only asymmetric confidence output — PDE is explicitly symmetrized (`logits + logitsᵀ`), and pLDDT / experimentally-resolved come from the single representation. pTM and ipTM are derived from `pae_probs`, so they were affected as well.
 
 **Checked and confirmed consistent** (no fix needed): the PAE/PDE bin decoding — AF3's `linspace(0, 31.0, 63)` + half-step + catch-all and OF3's `get_bin_centers(0, 32, 64)` both yield centers `0.25, 0.75, …, 31.75`; and the representative-atom choice feeding `linear_distance` — AF3's pseudo-beta (CB, CA for Gly, C4 for purines, C2 for pyrimidines, atom 0 for ligands) matches OF3's `get_token_representative_atoms` exactly.
+
+---
+
+## Verification
+
+The conversion was audited three ways, using the scripts in
+`scripts/of3_verification/` (see the README there). They need the OF3 checkpoint
+plus, for the module comparisons, an importable `openfold3`. The fast unit tests
+are in `src/alphafold3/model/of3_weight_converter_test.py`.
+
+**Weight coverage.** Instrumenting `_get`/`_has` over a full conversion shows
+4172 of 4936 checkpoint tensors are read. The remaining 764 are all under
+`sample_diffusion.*`, which is a bit-identical duplicate of `diffusion_module.*`
+(763 pairs compared, max|Δ| = 0), plus `version_tensor`. No tensor is silently
+dropped and no key is probed without being used.
+
+**Structural comparison against real AF3 params.** Every converted array matches
+the native `af3.bin.zst` parameter tree in name and shape, except:
+* the diffusion transformer, which legitimately differs under `of3_weights`
+  (`__layer_stack_no_per_layer` because the OF3 branch omits
+  `with_per_layer_inputs=True`; per-block `pair_input_layer_norm` /
+  `pair_logits_projection` inside the stack; the two Fourier params), and
+* `single_cond_initial_norm` / `single_cond_initial_projection`, which are 833
+  rather than 831 rows for the LayerNorm reason described above.
+
+Zero shape mismatches elsewhere also rules out every head-dimension swap, since
+`num_head != head_dim` in all attention configs.
+
+**Numerical module comparison.** Real OF3 PyTorch modules were run against the
+real AF3 Haiku modules loaded with converted weights, on identical inputs. This
+is what catches the error classes no shape check can see: square-matrix
+transposes, SwiGLU gate-vs-value order, and block ordering within a layer stack.
+
+| module | relative error |
+|---|---|
+| trunk PairFormer block (0 and 47 of 48) | 2e-5 |
+| MSA module block (0 and 3 of 4) | 3e-6 |
+| diffusion transformer (all 24 blocks) | 3e-5 |
+| template pair-stack block (0 and 1) | 2e-6 |
+| confidence pairformer block (0 and 3 of 4) | 1e-5 |
+| diffusion conditioning (Algorithm 21) | 4e-7 |
+| trunk/MSA input embeddings, confidence pair embed | 1e-5 |
+| pae / pde / plddt / experimentally-resolved / distogram heads | exactly 0 |
+
+Testing both ends of each stack confirms block order is not reversed. Residuals
+are float32 accumulation noise; each harness was validated to *fail* when a
+single weight is deliberately transposed or scaled. This covers 99% of the 368M
+converted parameters (364.7M). The remaining 1% is the atom cross-attention
+transformers (2.81M), the atom feature embedders (0.60M) and evoformer
+miscellany (0.32M — prev embeddings, relpos, bond embedding, template output);
+AF3's `CrossAttTransformer` needs a constructed `queries_to_keys` gather layout,
+and a hand-built stand-in risks a false result more than it buys confidence.
+
+### Benign asymmetries confirmed during the audit
+
+* **`_stack_blocks` zero-fills** any key a later block lacks. This fires for
+  real: OF3's last MSA block drops `msa_att_row`/`msa_transition`
+  (`last_block=True`). Zero weights make AF3's corresponding sub-modules output
+  exactly zero, so adding them is a true skip — the MSA output difference for
+  that block is 0. Correct, but note it would also silently hide a genuine
+  omission.
+* **pLDDT / experimentally-resolved heads** are sized for 23 atoms per token in
+  OF3 versus AF3's 24, and are zero-padded. The padded slot is unreachable: the
+  largest standard residue is RNA G with 23 heavy atoms, and non-standard
+  residues are atomized to one atom per token.
+* **The non-`_1` atom pair-conditioning params are dead.** AF3 calls
+  `token_atoms_single_cond, _ = _per_atom_conditioning(...)`, discarding that
+  site's pair output, so only the `_1` copies (the real queries×keys
+  conditioning) matter. Writing OF3's single weight set into both is harmless.
+* **Relative-position encoding layouts agree**: both are
+  `[rel_pos(66) | rel_token(66) | same_entity(1) | rel_chain(6)]` with identical
+  clipping and out-of-range sentinels, so `linear_relpos` needs no reordering.
+  Verified numerically via the diffusion conditioning, which feeds relpos and the
+  trunk pair rep through one linear.
 
 ---
 
